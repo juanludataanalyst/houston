@@ -24,13 +24,16 @@ pub struct EngineState {
 
 impl EngineState {
     pub fn new(paths: EnginePaths, events: DynEventSink, db: Database) -> Self {
-        // Build a SessionRuntime with the persistent PID recorder
-        // already wired in so every session::start logs its CLI pid to
-        // `~/.houston/runtime/cli_pids.json`. Tests constructing
-        // SessionRuntime via `Default` skip this and get a no-op
-        // recorder by virtue of the `Option<DynPidRecorder>` being None.
-        let sessions = SessionRuntime::with_pid_recorder(
-            crate::runtime_pids::recorder(paths.home().to_path_buf()),
+        // Build a production SessionRuntime: home_dir set so lease ops
+        // land in `~/.houston/runtime/leases.json`, plus the persistent
+        // PID recorder so spawned CLI pids end up in
+        // `~/.houston/runtime/cli_pids.json` for next-boot orphan
+        // reaping. Tests using `SessionRuntime::default()` get None for
+        // both and the session code skips those side-effects.
+        let home_dir = paths.home().to_path_buf();
+        let sessions = SessionRuntime::for_engine(
+            home_dir.clone(),
+            crate::runtime_pids::recorder(home_dir),
         );
         Self {
             paths,

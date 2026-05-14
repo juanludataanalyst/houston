@@ -165,8 +165,10 @@ async fn main() {
     // HTTP request sees the post-reconcile state instead of an orphan
     // `running` row.
     let docs_for_reaper = state.config.docs_dir.clone();
+    let home_for_reaper = state.config.home_dir.clone();
     let events_for_reaper = state.engine.events.clone();
     match houston_engine_core::reaper::reconcile_on_boot(
+        &home_for_reaper,
         &docs_for_reaper,
         &events_for_reaper,
     ) {
@@ -229,10 +231,11 @@ fn spawn_cli_lifecycles(state: Arc<ServerState>) {
 /// Spawn the background reaper sweep. Runs forever; uses the same
 /// event sink as everything else so transitions fan out to WS clients.
 fn spawn_reaper_loop(state: Arc<ServerState>) {
+    let home_dir = state.config.home_dir.clone();
     let docs_dir = state.config.docs_dir.clone();
     let events = state.engine.events.clone();
     tokio::spawn(async move {
-        houston_engine_core::reaper::run_reaper_loop(docs_dir, events).await;
+        houston_engine_core::reaper::run_reaper_loop(home_dir, docs_dir, events).await;
     });
 }
 

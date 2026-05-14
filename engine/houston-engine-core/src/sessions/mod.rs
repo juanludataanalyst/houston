@@ -51,6 +51,15 @@ pub struct SessionRuntime {
     /// `EngineState::new`; `None` in tests / contexts that don't have
     /// a real home dir (the session runner treats `None` as "skip").
     pub pid_recorder: Option<DynPidRecorder>,
+    /// `~/.houston/` root. Used to address `runtime/leases.json` (the
+    /// engine-owned lease store) from session task code without
+    /// plumbing through every call. `None` in tests that don't care
+    /// about lease behavior; in production `EngineState::new` always
+    /// sets this from `EnginePaths::home()`. When `None`, lease ops
+    /// are skipped — the activity still flips to Running so the UI
+    /// doesn't stick on Queued, but no lease is attached so the
+    /// reaper will Interrupt on first sweep (fail-noisy for misconfig).
+    pub home_dir: Option<PathBuf>,
     workdir_locks: WorkdirLocks,
     control: SessionControl,
     turn_locks: SessionTurnLocks,
@@ -58,10 +67,18 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    /// Construct with a persistent `PidRecorder` attached. Production
-    /// engines should use this so spawned CLI pids end up in the
-    /// orphan-reap file; tests can stay on `default()` and skip
-    /// recording entirely.
+    /// Construct a production-ready runtime: home_dir set so lease ops
+    /// land in the right runtime file, plus the pid recorder so orphan
+    /// reap works on the next boot. Used by `EngineState::new`.
+    pub fn for_engine(home_dir: PathBuf, recorder: DynPidRecorder) -> Self {
+        let mut rt = Self::default();
+        rt.home_dir = Some(home_dir);
+        rt.pid_recorder = Some(recorder);
+        rt
+    }
+
+    /// Back-compat constructor used by call sites that only set a pid
+    /// recorder. Prefer [`for_engine`] when home_dir is available.
     pub fn with_pid_recorder(recorder: DynPidRecorder) -> Self {
         let mut rt = Self::default();
         rt.pid_recorder = Some(recorder);
@@ -194,20 +211,23 @@ async fn run_start(
         // the user explicitly cancelled — surface that on the board
         // instead of leaving the row in `Queued`. clear_lease_and_set_status
         // tolerates the no-lease case (it's a status-only mutation here).
-        match crate::agents::lifecycle::clear_lease_and_set_status(
-            &agent_dir,
-            &session_key,
-            crate::agents::ActivityStatus::Cancelled,
-        ) {
-            Ok(Some(_)) => {
-                events.emit(HoustonEvent::ActivityChanged {
-                    agent_path: agent_dir.to_string_lossy().to_string(),
-                });
+        if let Some(home) = rt.home_dir.as_deref() {
+            match crate::agents::lifecycle::clear_lease_and_set_status(
+                home,
+                &agent_dir,
+                &session_key,
+                crate::agents::ActivityStatus::Cancelled,
+            ) {
+                Ok(Some(_)) => {
+                    events.emit(HoustonEvent::ActivityChanged {
+                        agent_path: agent_dir.to_string_lossy().to_string(),
+                    });
+                }
+                Ok(None) => {} // ad-hoc session — no board row to flip
+                Err(e) => tracing::warn!(
+                    "[sessions] failed to mark cancelled queued turn: {e} (session_key={session_key})"
+                ),
             }
-            Ok(None) => {} // ad-hoc session — no board row to flip
-            Err(e) => tracing::warn!(
-                "[sessions] failed to mark cancelled queued turn: {e} (session_key={session_key})"
-            ),
         }
         rt.control.finish(&identity).await;
         return Ok(());
@@ -277,8 +297,8 @@ async fn run_start(
     // heartbeat task spawned below; when it sees a lease_id mismatch
     // (e.g. the reaper rotated us out, or a Resume click handed
     // ownership to a different runner) the heartbeat stops on its own.
-    let attached =
-        match crate::agents::lifecycle::attach_lease(&agent_dir, &session_key) {
+    let attached = if let Some(home) = rt.home_dir.as_deref() {
+        match crate::agents::lifecycle::attach_lease(home, &agent_dir, &session_key) {
             Ok(Some((_, lease))) => {
                 events.emit(HoustonEvent::ActivityChanged {
                     agent_path: agent_path.clone(),
@@ -292,7 +312,17 @@ async fn run_start(
                 );
                 None
             }
-        };
+        }
+    } else {
+        // Test or misconfigured runtime: no home_dir, so no engine-owned
+        // lease store. Skip lease attach; the reaper will see a leaseless
+        // Running row on next sweep and Interrupt it. This is the fail-
+        // noisy mode — production paths always set home_dir.
+        tracing::warn!(
+            "[sessions] home_dir not configured; skipping lease attach (session_key={session_key})"
+        );
+        None
+    };
 
     // Background heartbeat: every HEARTBEAT_INTERVAL while the session
     // is alive, push the lease's expires_at forward. The reaper's TTL
@@ -310,7 +340,7 @@ async fn run_start(
     let (heartbeat_task, hb_stop_tx): (
         Option<tokio::task::JoinHandle<()>>,
         Option<tokio::sync::oneshot::Sender<()>>,
-    ) = if let Some(lease) = attached.clone() {
+    ) = if let (Some(lease), Some(home)) = (attached.clone(), rt.home_dir.clone()) {
         let agent_dir_hb = agent_dir.clone();
         let session_key_hb = session_key.clone();
         let lease_id = lease.lease_id.clone();
@@ -331,6 +361,7 @@ async fn run_start(
                     _ = &mut rx => break, // session ended, graceful stop
                     _ = ticker.tick() => {
                         match crate::agents::lifecycle::extend_lease(
+                            &home,
                             &agent_dir_hb,
                             &session_key_hb,
                             &lease_id,
@@ -469,11 +500,14 @@ async fn run_start(
                     "[sessions] heartbeat task panicked during session_key={session_key_for_end}; \
                      forcing Interrupted to avoid 30s lease-TTL wait"
                 );
-                let _ = crate::agents::lifecycle::clear_lease_and_set_status(
-                    &agent_dir_for_end,
-                    &session_key_for_end,
-                    crate::agents::ActivityStatus::Interrupted,
-                );
+                if let Some(home) = rt.home_dir.as_deref() {
+                    let _ = crate::agents::lifecycle::clear_lease_and_set_status(
+                        home,
+                        &agent_dir_for_end,
+                        &session_key_for_end,
+                        crate::agents::ActivityStatus::Interrupted,
+                    );
+                }
                 events_for_end.emit(HoustonEvent::ActivityChanged {
                     agent_path: agent_path_for_end.clone(),
                 });
@@ -507,28 +541,31 @@ async fn run_start(
         rt.control.finish(&identity).await;
         return Ok(());
     }
-    match crate::agents::lifecycle::clear_lease_and_set_status(
-        &agent_dir_for_end,
-        &session_key_for_end,
-        next_status,
-    ) {
-        Ok(Some(_)) => {
-            tracing::info!(
-                "[sessions] end flip: session_key={session_key_for_end} status={next_status}"
-            );
-            events_for_end.emit(HoustonEvent::ActivityChanged {
-                agent_path: agent_path_for_end,
-            });
-        }
-        Ok(None) => {
-            tracing::info!(
-                "[sessions] end flip: no matching activity for session_key={session_key_for_end} (ad-hoc session — skipped)"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "[sessions] failed to flip activity to {next_status}: {e} (session_key={session_key_for_end})"
-            );
+    if let Some(home) = rt.home_dir.as_deref() {
+        match crate::agents::lifecycle::clear_lease_and_set_status(
+            home,
+            &agent_dir_for_end,
+            &session_key_for_end,
+            next_status,
+        ) {
+            Ok(Some(_)) => {
+                tracing::info!(
+                    "[sessions] end flip: session_key={session_key_for_end} status={next_status}"
+                );
+                events_for_end.emit(HoustonEvent::ActivityChanged {
+                    agent_path: agent_path_for_end,
+                });
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "[sessions] end flip: no matching activity for session_key={session_key_for_end} (ad-hoc session — skipped)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[sessions] failed to flip activity to {next_status}: {e} (session_key={session_key_for_end})"
+                );
+            }
         }
     }
     rt.control.finish(&identity).await;

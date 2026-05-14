@@ -39,13 +39,13 @@ fn create_locked(root: &Path, input: NewActivity) -> CoreResult<Activity> {
         title: input.title,
         description: input.description,
         // Start in `Queued`, NOT `Running`. The CLI hasn't been spawned
-        // yet and no lease exists — if we said `Running` here the reaper
-        // would (correctly) see a leaseless `running` row and flip it
-        // to `Interrupted` before `sessions::start` had a chance to
-        // promote it. `Queued` is the row's honest state until the
-        // session task takes ownership.
+        // yet and no lease exists in the engine-owned lease store — if
+        // we said `Running` here the reaper would (correctly) see a
+        // leaseless `running` row and flip it to `Interrupted` before
+        // `sessions::start` had a chance to attach a lease. `Queued`
+        // is the row's honest state until the session task takes
+        // ownership via `lifecycle::attach_lease`.
         status: ActivityStatus::Queued,
-        lease: None,
         claude_session_id: None,
         session_key: Some(session_key),
         agent: input.agent,

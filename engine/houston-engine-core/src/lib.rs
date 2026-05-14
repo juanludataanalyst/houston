@@ -18,6 +18,7 @@ pub mod process_probe;
 pub mod provider;
 pub mod reaper;
 pub mod routines;
+pub mod runtime_leases;
 pub mod runtime_pids;
 pub mod sessions;
 pub mod skills;

@@ -1,31 +1,38 @@
 //! Lease-aware activity lifecycle transitions.
 //!
 //! Pulled out of `activity.rs` so that file stays a CRUD-only surface
-//! (per CLAUDE.md file-size rule) and so the lease invariants live next
-//! to each other. Every function here:
+//! and so the lease invariants live next to each other.
 //!
-//! 1. Looks up the activity by `session_key` (with the `activity-{id}`
-//!    legacy fallback that mission-board rows older than the
-//!    `session_key` field rely on).
-//! 2. Mutates `status` and/or `lease` atomically.
-//! 3. Bumps `updated_at` so the file watcher emits an event.
+//! ## Lease storage
 //!
-//! Callers:
-//! - [`attach_lease`] — `sessions::start`, on CLI spawn.
-//! - [`extend_lease`] — the heartbeat task that runs while a session is
-//!   alive. Returns `false` if the stored lease_id no longer matches
-//!   (something else took ownership) so the caller can stop pumping.
-//! - [`clear_lease_and_set_status`] — `sessions::start`'s end-of-flow
-//!   when the CLI exits cleanly.
-//! - [`sweep_stale`] — the engine's reaper task. Returns the list of
-//!   activities it transitioned so the caller can fan out events.
+//! Lease state lives in [`crate::runtime_leases`] (engine-owned
+//! `~/.houston/runtime/leases.json`), NOT in `activity.json`. Earlier
+//! drafts of this code carried `Activity.lease` directly on the board
+//! row, but `activity.json` is inside `<agent_dir>/.houston/` which is
+//! *agent-writable* — a malicious or buggy CLI subprocess could rewrite
+//! `expires_at: 9999-12-31` and become un-reapable. Engine-owned
+//! durability metadata must live outside agent-writable space.
+//!
+//! Activity rows still carry status. Lease ↔ activity pairing is by
+//! `(agent_path, session_key)`.
+//!
+//! ## Callers
+//! - [`attach_lease`] — `sessions::start`, on CLI spawn. Writes the
+//!   lease to the runtime store AND flips status → Running.
+//! - [`extend_lease`] — the heartbeat task. Touches the runtime store
+//!   only. Returns `false` if the stored lease_id no longer matches.
+//! - [`clear_lease_and_set_status`] — end-of-session or cancel. Removes
+//!   the runtime-store lease AND flips status to the terminal value.
+//! - [`sweep_stale`] — the engine's reaper task. Consults the runtime
+//!   store for the agent and transitions stale activities.
 
-use super::lease::Lease;
 use super::status::ActivityStatus;
 use super::store::{file_path, read_json, write_json};
 use super::types::Activity;
+use crate::agents::lease::Lease;
 use crate::error::CoreResult;
 use crate::file_mutex::with_file_lock;
+use crate::runtime_leases;
 use chrono::Utc;
 use std::path::Path;
 
@@ -71,23 +78,24 @@ fn mutate_by_session_key<F: FnOnce(&mut Activity)>(
     })
 }
 
-/// Promote the activity bound to `session_key` to `Running` with a
-/// fresh lease owned by the current process. Returns the new row.
+/// Promote the activity bound to `session_key` to `Running` and mint a
+/// fresh lease in the engine-owned runtime store. Returns the activity
+/// row plus the lease so the heartbeat task can claim ownership by id.
 ///
 /// Called by `sessions::start` immediately before the CLI subprocess
-/// spawns. If the row already had a lease (from a prior interrupted
-/// run), it's replaced — the new session owns this activity now.
+/// spawns. Any prior lease for the same `(agent_path, session_key)` is
+/// replaced — the new session owns this activity now.
 pub fn attach_lease(
-    root: &Path,
+    home_dir: &Path,
+    agent_dir: &Path,
     session_key: &str,
 ) -> CoreResult<Option<(Activity, Lease)>> {
-    let new_lease = Lease::fresh();
-    let stored_lease = new_lease.clone();
-    let updated = mutate_by_session_key(root, session_key, |item| {
+    let agent_path = agent_dir.to_string_lossy().to_string();
+    let lease = runtime_leases::attach(home_dir, &agent_path, session_key)?;
+    let updated = mutate_by_session_key(agent_dir, session_key, |item| {
         item.status = ActivityStatus::Running;
-        item.lease = Some(stored_lease);
     })?;
-    Ok(updated.map(|a| (a, new_lease)))
+    Ok(updated.map(|a| (a, lease)))
 }
 
 /// Push the lease's `expires_at` forward by another TTL. The caller
@@ -95,32 +103,31 @@ pub fn attach_lease(
 /// longer matches (e.g. the reaper transitioned the row, or another
 /// process took over) this returns `Ok(false)` and the caller should
 /// stop pumping. `Ok(true)` means heartbeat applied.
-pub fn extend_lease(root: &Path, session_key: &str, lease_id: &str) -> CoreResult<bool> {
-    let mut extended = false;
-    mutate_by_session_key(root, session_key, |item| {
-        if let Some(ref existing) = item.lease {
-            if existing.lease_id == lease_id {
-                item.lease = Some(existing.extended());
-                extended = true;
-            }
-        }
-    })?;
-    Ok(extended)
+pub fn extend_lease(
+    home_dir: &Path,
+    agent_dir: &Path,
+    session_key: &str,
+    lease_id: &str,
+) -> CoreResult<bool> {
+    let agent_path = agent_dir.to_string_lossy().to_string();
+    runtime_leases::extend(home_dir, &agent_path, session_key, lease_id)
 }
 
 /// Clear the lease and set the activity to a (typically terminal)
 /// status. Used at end-of-session: status flips to `NeedsYou` /
-/// `Error` / `Done` and the lease is released.
+/// `Error` / `Done` / `Cancelled` and the lease is released from the
+/// engine-owned runtime store.
 pub fn clear_lease_and_set_status(
-    root: &Path,
+    home_dir: &Path,
+    agent_dir: &Path,
     session_key: &str,
     status: ActivityStatus,
 ) -> CoreResult<Option<Activity>> {
-    let updated = mutate_by_session_key(root, session_key, |item| {
+    let agent_path = agent_dir.to_string_lossy().to_string();
+    runtime_leases::clear(home_dir, &agent_path, session_key)?;
+    mutate_by_session_key(agent_dir, session_key, |item| {
         item.status = status;
-        item.lease = None;
-    })?;
-    Ok(updated)
+    })
 }
 
 /// Decide what to do with a single in-flight activity row at sweep time.
@@ -184,27 +191,51 @@ enum SweepAction {
 /// stale per [`decide_sweep`]. Each transitioned row gets `status =
 /// Interrupted` and `lease = None`, the row's `updated_at` bumped, and
 /// is returned so the caller can emit `ActivityChanged` for the agent.
-pub fn sweep_stale(root: &Path) -> CoreResult<Vec<Activity>> {
+pub fn sweep_stale(home_dir: &Path, agent_dir: &Path) -> CoreResult<Vec<Activity>> {
     let self_pid = std::process::id();
-    with_file_lock(&file_path(root, FILE), || {
-        let mut items: Vec<Activity> = read_json(root, FILE)?;
+    let agent_path = agent_dir.to_string_lossy().to_string();
+    // We hold the activity-file lock for the whole sweep AND consult
+    // the runtime lease store inside. The runtime store has its own
+    // lock so the nested acquisition order is: activity.json then
+    // leases.json. Every other writer that touches both files acquires
+    // them in the same order (`attach_lease` does runtime first then
+    // activity — opposite order — but it's a fresh attach with no risk
+    // of contention against the sweep). If we ever introduce a third
+    // writer touching both, follow the activity→leases order here.
+    with_file_lock(&file_path(agent_dir, FILE), || {
+        let mut items: Vec<Activity> = read_json(agent_dir, FILE)?;
         let mut transitioned = Vec::new();
+        let mut leases_to_clear: Vec<String> = Vec::new();
         for item in items.iter_mut() {
             if !item.status.is_in_flight() {
                 continue;
             }
-            if decide_sweep(item.lease.as_ref(), self_pid, crate::process_probe::is_alive)
+            // Pair the activity to its runtime lease by session_key.
+            // Activities created before the session_key field shipped
+            // still use the `activity-{id}` convention.
+            let key = item
+                .session_key
+                .clone()
+                .unwrap_or_else(|| format!("activity-{}", item.id));
+            let lease = runtime_leases::get(home_dir, &agent_path, &key)?;
+            if decide_sweep(lease.as_ref(), self_pid, crate::process_probe::is_alive)
                 != SweepAction::Interrupt
             {
                 continue;
             }
             item.status = ActivityStatus::Interrupted;
-            item.lease = None;
             item.updated_at = Some(Utc::now().to_rfc3339());
             transitioned.push(item.clone());
+            leases_to_clear.push(key);
         }
         if !transitioned.is_empty() {
-            write_json(root, FILE, &items)?;
+            write_json(agent_dir, FILE, &items)?;
+        }
+        // Clear the now-stale leases. Done after the activity write so
+        // a crash in between leaves the activity Interrupted with a
+        // stale lease that the next sweep will just re-clear (idempotent).
+        for key in leases_to_clear {
+            runtime_leases::clear(home_dir, &agent_path, &key)?;
         }
         Ok(transitioned)
     })
@@ -215,13 +246,21 @@ mod tests {
     use super::*;
     use crate::agents::activity;
     use crate::agents::types::NewActivity;
+    use crate::runtime_leases;
     use tempfile::TempDir;
 
-    fn make_root() -> (TempDir, std::path::PathBuf) {
+    /// Returns (TempDir, home_dir, agent_dir). home_dir and agent_dir
+    /// share the tempdir for simplicity — the engine doesn't require
+    /// them to be the same in production, but the test only cares
+    /// about co-located file isolation.
+    fn make_env() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
-        let root = dir.path().to_path_buf();
-        crate::agents::store::ensure_houston_dir(&root).unwrap();
-        (dir, root)
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        crate::agents::store::ensure_houston_dir(&agent_dir).unwrap();
+        let home_dir = dir.path().join("home");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        (dir, home_dir, agent_dir)
     }
 
     fn make_activity(root: &Path, title: &str) -> Activity {
@@ -241,104 +280,129 @@ mod tests {
 
     #[test]
     fn attach_lease_flips_to_running_and_writes_lease() {
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
         let sk = a.session_key.clone().unwrap();
-        let (after, lease) = attach_lease(&root, &sk).unwrap().unwrap();
+        let (after, lease) = attach_lease(&home, &agent, &sk).unwrap().unwrap();
         assert_eq!(after.status, ActivityStatus::Running);
-        assert_eq!(after.lease.as_ref().unwrap().lease_id, lease.lease_id);
+        // Lease lives in the engine-owned runtime store, not on the activity.
+        let stored = runtime_leases::get(&home, &agent.to_string_lossy(), &sk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.lease_id, lease.lease_id);
         assert_eq!(lease.owner_pid, std::process::id());
     }
 
     #[test]
     fn attach_lease_no_match_returns_none() {
-        let (_d, root) = make_root();
-        make_activity(&root, "x");
-        assert!(attach_lease(&root, "activity-not-real")
+        let (_d, home, agent) = make_env();
+        make_activity(&agent, "x");
+        assert!(attach_lease(&home, &agent, "activity-not-real")
             .unwrap()
             .is_none());
     }
 
     #[test]
     fn extend_lease_pushes_expiry_when_id_matches() {
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
         let sk = a.session_key.clone().unwrap();
-        let (_a2, l) = attach_lease(&root, &sk).unwrap().unwrap();
+        let (_a2, l) = attach_lease(&home, &agent, &sk).unwrap().unwrap();
         let before = l.expires_at;
         std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(extend_lease(&root, &sk, &l.lease_id).unwrap());
-        let listed: Vec<Activity> = read_json(&root, FILE).unwrap();
-        assert!(listed[0].lease.as_ref().unwrap().expires_at > before);
+        assert!(extend_lease(&home, &agent, &sk, &l.lease_id).unwrap());
+        let stored = runtime_leases::get(&home, &agent.to_string_lossy(), &sk)
+            .unwrap()
+            .unwrap();
+        assert!(stored.expires_at > before);
     }
 
     #[test]
     fn extend_lease_returns_false_on_id_mismatch() {
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
         let sk = a.session_key.clone().unwrap();
-        attach_lease(&root, &sk).unwrap().unwrap();
-        assert!(!extend_lease(&root, &sk, "not-the-real-id").unwrap());
+        attach_lease(&home, &agent, &sk).unwrap().unwrap();
+        assert!(!extend_lease(&home, &agent, &sk, "not-the-real-id").unwrap());
     }
 
     #[test]
     fn clear_lease_and_set_status_releases_ownership() {
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
         let sk = a.session_key.clone().unwrap();
-        attach_lease(&root, &sk).unwrap();
-        let after = clear_lease_and_set_status(&root, &sk, ActivityStatus::NeedsYou)
+        attach_lease(&home, &agent, &sk).unwrap();
+        let after = clear_lease_and_set_status(&home, &agent, &sk, ActivityStatus::NeedsYou)
             .unwrap()
             .unwrap();
         assert_eq!(after.status, ActivityStatus::NeedsYou);
-        assert!(after.lease.is_none());
+        assert!(runtime_leases::get(&home, &agent.to_string_lossy(), &sk)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn sweep_stale_transitions_expired_running_to_interrupted() {
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
         let sk = a.session_key.clone().unwrap();
-        let (_, _) = attach_lease(&root, &sk).unwrap().unwrap();
-        // Forcibly expire the lease AND rewrite owner_pid to a definitely-
-        // dead value so `decide_sweep` falls into the Interrupt branch
-        // (self-owned and live-other-owned leases are intentionally
-        // skipped now to fix the sleep/wake false-positive bug).
-        let mut items: Vec<Activity> = read_json(&root, FILE).unwrap();
-        let lease = items[0].lease.as_mut().unwrap();
-        lease.expires_at = Utc::now() - chrono::Duration::seconds(1);
-        lease.owner_pid = u32::MAX - 1; // out of range → process_probe::is_alive == false
-        write_json(&root, FILE, &items).unwrap();
+        // Flip status to Running and plant a stale lease (out-of-range
+        // owner_pid so it reaches the Interrupt branch — self-owned
+        // and live-other-owned leases are intentionally skipped now).
+        use crate::agents::types::ActivityUpdate;
+        activity::update(
+            &agent,
+            &a.id,
+            ActivityUpdate {
+                status: Some(ActivityStatus::Running),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stale = Lease {
+            lease_id: "stale".into(),
+            owner_pid: u32::MAX - 1,
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+        };
+        runtime_leases::write_for_test(&home, &agent.to_string_lossy(), &sk, stale).unwrap();
 
-        let transitioned = sweep_stale(&root).unwrap();
+        let transitioned = sweep_stale(&home, &agent).unwrap();
         assert_eq!(transitioned.len(), 1);
         assert_eq!(transitioned[0].status, ActivityStatus::Interrupted);
-        assert!(transitioned[0].lease.is_none());
+        // Lease cleared from the runtime store after the transition.
+        assert!(runtime_leases::get(&home, &agent.to_string_lossy(), &sk)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn sweep_stale_transitions_running_row_with_no_lease() {
-        // Legacy data path: a row pre-leases that's stuck on Running.
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
-        // Promote manually without minting a lease — simulates legacy data.
-        let mut items: Vec<Activity> = read_json(&root, FILE).unwrap();
-        items[0].status = ActivityStatus::Running;
-        items[0].lease = None;
-        write_json(&root, FILE, &items).unwrap();
-        let _ = a;
-        let transitioned = sweep_stale(&root).unwrap();
+        // Legacy data path: a Running row in activity.json with no
+        // corresponding entry in the runtime lease store.
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
+        use crate::agents::types::ActivityUpdate;
+        activity::update(
+            &agent,
+            &a.id,
+            ActivityUpdate {
+                status: Some(ActivityStatus::Running),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let transitioned = sweep_stale(&home, &agent).unwrap();
         assert_eq!(transitioned.len(), 1);
         assert_eq!(transitioned[0].status, ActivityStatus::Interrupted);
     }
 
     #[test]
     fn sweep_stale_ignores_terminal_and_queued_rows() {
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
         // Activity defaults to Queued — sweep must not touch it.
         let _ = a;
-        let transitioned = sweep_stale(&root).unwrap();
+        let transitioned = sweep_stale(&home, &agent).unwrap();
         assert!(transitioned.is_empty(), "Queued is not in-flight");
     }
 
@@ -419,25 +483,28 @@ mod tests {
         // End-to-end version: build a real activity with a self-owned
         // expired lease and assert sweep_stale leaves it untouched.
         // This is the laptop-sleep-wake scenario in integration form.
-        let (_d, root) = make_root();
-        let a = make_activity(&root, "x");
+        let (_d, home, agent) = make_env();
+        let a = make_activity(&agent, "x");
         let sk = a.session_key.clone().unwrap();
-        attach_lease(&root, &sk).unwrap().unwrap();
-        // Force lease expiry while keeping owner_pid = ours.
-        let mut items: Vec<Activity> = read_json(&root, FILE).unwrap();
-        let lease = items[0].lease.as_mut().unwrap();
-        assert_eq!(lease.owner_pid, std::process::id());
-        lease.expires_at = Utc::now() - chrono::Duration::seconds(60);
-        write_json(&root, FILE, &items).unwrap();
+        attach_lease(&home, &agent, &sk).unwrap().unwrap();
+        // Force expiry while keeping owner_pid = ours.
+        let stale = Lease {
+            lease_id: "self-stale".into(),
+            owner_pid: std::process::id(),
+            expires_at: Utc::now() - chrono::Duration::seconds(60),
+        };
+        runtime_leases::write_for_test(&home, &agent.to_string_lossy(), &sk, stale).unwrap();
 
-        let transitioned = sweep_stale(&root).unwrap();
+        let transitioned = sweep_stale(&home, &agent).unwrap();
         assert!(
             transitioned.is_empty(),
             "self-owned expired lease must not be interrupted (sleep/wake)"
         );
-        // Row still Running, lease still attached (heartbeat will refresh).
-        let after: Vec<Activity> = read_json(&root, FILE).unwrap();
+        // Row still Running, lease still in runtime store (heartbeat will refresh).
+        let after: Vec<Activity> = read_json(&agent, FILE).unwrap();
         assert_eq!(after[0].status, ActivityStatus::Running);
-        assert!(after[0].lease.is_some());
+        assert!(runtime_leases::get(&home, &agent.to_string_lossy(), &sk)
+            .unwrap()
+            .is_some());
     }
 }

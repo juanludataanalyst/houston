@@ -22,23 +22,20 @@ export type ActivityStatus =
   | "cancelled"
   | "interrupted";
 
-/**
- * Durability ownership token. Present only on in-flight (queued/running)
- * rows; the engine clears it on every terminal transition. Mirrors
- * `engine/houston-engine-core/src/agents/lease.rs`.
- */
-export interface ActivityLease {
-  lease_id: string;
-  owner_pid: number;
-  expires_at: string;
-}
+// Lease metadata (lease_id, owner_pid, expires_at) lives in the
+// engine-owned runtime store at ~/.houston/runtime/leases.json — NOT
+// on the activity row. The UI doesn't need it for display, and putting
+// it inside the agent-writable `.houston/activity/activity.json` would
+// let a buggy or malicious agent forge `expires_at` and become
+// un-reapable. If the UI ever needs to surface "this mission has an
+// active lease", expose a dedicated endpoint rather than putting the
+// raw token back on the activity record.
 
 export interface Activity {
   id: string;
   title: string;
   description: string;
   status: ActivityStatus;
-  lease?: ActivityLease | null;
   claude_session_id?: string | null;
   session_key?: string;
   agent?: string;

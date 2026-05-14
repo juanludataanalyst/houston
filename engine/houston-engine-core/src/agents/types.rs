@@ -3,7 +3,6 @@
 //! Relocated from `app/houston-tauri/src/agent_store/types.rs`. Wire-compatible
 //! with existing on-disk JSON.
 
-use super::lease::Lease;
 use super::routine_run_status::RoutineRunStatus;
 use super::status::ActivityStatus;
 use serde::{Deserialize, Serialize};
@@ -16,12 +15,6 @@ pub struct Activity {
     pub title: String,
     pub description: String,
     pub status: ActivityStatus,
-    /// Durability lease held by the engine task that owns the CLI for
-    /// this activity. `None` on terminal rows and on legacy data written
-    /// before leases existed. Reaper interprets `None` on non-terminal
-    /// rows as "expired immediately" so old data heals on first sweep.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease: Option<Lease>,
     pub claude_session_id: Option<String>,
     /// Optional override for the session key used to address this conversation.
     /// When set (e.g. by a routine run), the board uses this instead of "activity-{id}".

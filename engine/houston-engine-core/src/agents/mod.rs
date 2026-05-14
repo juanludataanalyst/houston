@@ -136,10 +136,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(a.title, "first");
-        // Newly-created activities start `Queued`; `sessions::start` is what
-        // promotes them to `Running` (and mints a lease) once the CLI spawns.
+        // Newly-created activities start `Queued`; `sessions::start` is
+        // what promotes them to `Running` and attaches a lease in the
+        // engine-owned runtime store (not on the activity row itself).
         assert_eq!(a.status, ActivityStatus::Queued);
-        assert!(a.lease.is_none(), "lease minted on session start, not on create");
         assert!(s.list_activity().unwrap().len() == 1);
         let updated = s
             .update_activity(

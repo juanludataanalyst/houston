@@ -27,14 +27,14 @@ use std::path::{Path, PathBuf};
 /// Errors from individual agents are logged at `warn` and the sweep
 /// continues — a poisoned activity.json on one agent must not block
 /// recovery of every other agent's missions.
-pub fn sweep_once(docs_dir: &Path, events: &DynEventSink) -> usize {
+pub fn sweep_once(home_dir: &Path, docs_dir: &Path, events: &DynEventSink) -> usize {
     let mut transitioned = 0usize;
     for agent_dir in walk_agent_dirs(docs_dir) {
         // Only walk agents that have actually been initialized.
         if !agent_dir.join(".houston").join("activity").is_dir() {
             continue;
         }
-        match lifecycle::sweep_stale(&agent_dir) {
+        match lifecycle::sweep_stale(home_dir, &agent_dir) {
             Ok(transitions) if transitions.is_empty() => {}
             Ok(transitions) => {
                 transitioned += transitions.len();
@@ -67,7 +67,7 @@ pub fn sweep_once(docs_dir: &Path, events: &DynEventSink) -> usize {
 /// the join handle. Spawn from engine `main()` AFTER the boot
 /// reconciliation sweep so the first iteration here is just
 /// steady-state.
-pub async fn run_reaper_loop(docs_dir: PathBuf, events: DynEventSink) {
+pub async fn run_reaper_loop(home_dir: PathBuf, docs_dir: PathBuf, events: DynEventSink) {
     let interval_std = REAPER_INTERVAL
         .to_std()
         .unwrap_or(std::time::Duration::from_secs(10));
@@ -77,7 +77,7 @@ pub async fn run_reaper_loop(docs_dir: PathBuf, events: DynEventSink) {
     // agent if there's nothing to clean up.
     loop {
         ticker.tick().await;
-        let n = sweep_once(&docs_dir, &events);
+        let n = sweep_once(&home_dir, &docs_dir, &events);
         if n > 0 {
             tracing::info!(
                 target: "reaper",
@@ -126,8 +126,12 @@ fn walk_agent_dirs(docs_dir: &Path) -> Vec<PathBuf> {
 /// HTTP. Distinct entry point so callers see intent at the call site
 /// and so we can add boot-only behavior (e.g. stale-Queued reaping) in
 /// future without touching the periodic path.
-pub fn reconcile_on_boot(docs_dir: &Path, events: &DynEventSink) -> CoreResult<usize> {
-    let n = sweep_once(docs_dir, events);
+pub fn reconcile_on_boot(
+    home_dir: &Path,
+    docs_dir: &Path,
+    events: &DynEventSink,
+) -> CoreResult<usize> {
+    let n = sweep_once(home_dir, docs_dir, events);
     if n > 0 {
         tracing::info!(
             target: "reaper",
@@ -157,7 +161,7 @@ mod tests {
         p
     }
 
-    fn make_running_activity_with_expired_lease(agent: &Path, title: &str) {
+    fn make_running_activity_with_expired_lease(home: &Path, agent: &Path, title: &str) {
         let a = activity::create(
             agent,
             NewActivity {
@@ -171,29 +175,42 @@ mod tests {
         )
         .unwrap();
         let sk = a.session_key.unwrap();
-        attach_lease(agent, &sk).unwrap().unwrap();
-        // Expire the lease AND rewrite owner_pid to an out-of-range value
-        // so the sweep_stale rule reaches the Interrupt branch. Without
-        // the pid rewrite, `decide_sweep` (rightly) skips self-owned
-        // expired leases because that's the laptop-sleep/wake case.
-        let mut items: Vec<Activity> = read_json(agent, "activity").unwrap();
-        let lease = items[0].lease.as_mut().unwrap();
-        lease.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-        lease.owner_pid = u32::MAX - 1;
-        write_json(agent, "activity", &items).unwrap();
+        let agent_path = agent.to_string_lossy().to_string();
+        // Flip the activity to Running directly (skipping the normal
+        // attach_lease so we can plant a deliberately-stale lease).
+        use crate::agents::types::ActivityUpdate;
+        activity::update(
+            agent,
+            &a.id,
+            ActivityUpdate {
+                status: Some(ActivityStatus::Running),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Stale lease: expired AND owned by an out-of-range pid so the
+        // sweep_stale rule reaches the Interrupt branch (self-owned
+        // expired leases are intentionally skipped — sleep/wake fix).
+        let stale = crate::agents::lease::Lease {
+            lease_id: "test-stale".into(),
+            owner_pid: u32::MAX - 1,
+            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        crate::runtime_leases::write_for_test(home, &agent_path, &sk, stale).unwrap();
     }
 
     #[test]
     fn sweep_once_transitions_across_workspaces() {
         let d = TempDir::new().unwrap();
         let docs = d.path();
+        let home = d.path(); // co-locate for the test; in prod home != docs
         let a1 = make_agent(docs, "Personal", "alpha");
         let a2 = make_agent(docs, "Work", "beta");
-        make_running_activity_with_expired_lease(&a1, "alpha-one");
-        make_running_activity_with_expired_lease(&a2, "beta-one");
+        make_running_activity_with_expired_lease(home, &a1, "alpha-one");
+        make_running_activity_with_expired_lease(home, &a2, "beta-one");
 
         let sink: DynEventSink = Arc::new(BroadcastEventSink::new(64));
-        let n = sweep_once(docs, &sink);
+        let n = sweep_once(home, docs, &sink);
         assert_eq!(n, 2);
 
         // Both should now be Interrupted.
@@ -207,31 +224,34 @@ mod tests {
     fn sweep_once_skips_hidden_dirs_and_files() {
         let d = TempDir::new().unwrap();
         let docs = d.path();
+        let home = d.path();
         std::fs::create_dir_all(docs.join(".dotworkspace").join("agent")).unwrap();
         std::fs::write(docs.join("file.txt"), "").unwrap();
         let real = make_agent(docs, "Personal", "alpha");
-        make_running_activity_with_expired_lease(&real, "x");
+        make_running_activity_with_expired_lease(home, &real, "x");
 
         let sink: DynEventSink = Arc::new(BroadcastEventSink::new(64));
-        assert_eq!(sweep_once(docs, &sink), 1);
+        assert_eq!(sweep_once(home, docs, &sink), 1);
     }
 
     #[test]
     fn sweep_once_is_a_noop_when_no_stale_rows() {
         let d = TempDir::new().unwrap();
         let docs = d.path();
+        let home = d.path();
         make_agent(docs, "Personal", "alpha");
         let sink: DynEventSink = Arc::new(BroadcastEventSink::new(64));
-        assert_eq!(sweep_once(docs, &sink), 0);
+        assert_eq!(sweep_once(home, docs, &sink), 0);
     }
 
     #[test]
     fn reconcile_on_boot_returns_count() {
         let d = TempDir::new().unwrap();
         let docs = d.path();
+        let home = d.path();
         let a = make_agent(docs, "Personal", "alpha");
-        make_running_activity_with_expired_lease(&a, "x");
+        make_running_activity_with_expired_lease(home, &a, "x");
         let sink: DynEventSink = Arc::new(BroadcastEventSink::new(64));
-        assert_eq!(reconcile_on_boot(docs, &sink).unwrap(), 1);
+        assert_eq!(reconcile_on_boot(home, docs, &sink).unwrap(), 1);
     }
 }
