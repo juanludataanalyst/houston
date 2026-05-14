@@ -39,13 +39,21 @@ use std::path::Path;
 const FILE: &str = "activity";
 
 /// Find the activity matching `session_key`, then run `mutate` on it
-/// and persist. Returns the post-mutation row, or `None` if no activity
+/// and persist iff `mutate` returns `true`. Returns the post-mutation
+/// row (regardless of whether we wrote), or `None` if no activity
 /// matches (legitimate for ad-hoc sessions that have no board row).
+///
+/// The bool return from `mutate` lets callers avoid spurious file
+/// writes — e.g. `clear_lease_and_set_status` setting status to the
+/// value it already holds, or a heartbeat-style no-op. Each avoided
+/// write spares one ActivityChanged event from fanning out to every
+/// WS subscriber and one `updated_at` bump from the file watcher.
 ///
 /// Matching: exact `session_key` field, or the `activity-{id}` legacy
 /// convention. Backfills the `session_key` field on the row when matched
-/// via the legacy path so future lookups hit the fast path.
-fn mutate_by_session_key<F: FnOnce(&mut Activity)>(
+/// via the legacy path so future lookups hit the fast path (this
+/// backfill counts as a mutation and forces the write).
+fn mutate_by_session_key<F: FnOnce(&mut Activity) -> bool>(
     root: &Path,
     session_key: &str,
     mutate: F,
@@ -67,14 +75,21 @@ fn mutate_by_session_key<F: FnOnce(&mut Activity)>(
         }) else {
             return Ok(None);
         };
-        if item.session_key.as_deref() != Some(session_key) {
+        let backfilled = if item.session_key.as_deref() != Some(session_key) {
             item.session_key = Some(session_key.to_string());
+            true
+        } else {
+            false
+        };
+        let mutated = mutate(item);
+        if backfilled || mutated {
+            item.updated_at = Some(Utc::now().to_rfc3339());
+            let result = item.clone();
+            write_json(root, FILE, &items)?;
+            Ok(Some(result))
+        } else {
+            Ok(Some(item.clone()))
         }
-        mutate(item);
-        item.updated_at = Some(Utc::now().to_rfc3339());
-        let result = item.clone();
-        write_json(root, FILE, &items)?;
-        Ok(Some(result))
     })
 }
 
@@ -93,7 +108,9 @@ pub fn attach_lease(
     let agent_path = agent_dir.to_string_lossy().to_string();
     let lease = runtime_leases::attach(home_dir, &agent_path, session_key)?;
     let updated = mutate_by_session_key(agent_dir, session_key, |item| {
+        let changed = item.status != ActivityStatus::Running;
         item.status = ActivityStatus::Running;
+        changed
     })?;
     Ok(updated.map(|a| (a, lease)))
 }
@@ -126,7 +143,9 @@ pub fn clear_lease_and_set_status(
     let agent_path = agent_dir.to_string_lossy().to_string();
     runtime_leases::clear(home_dir, &agent_path, session_key)?;
     mutate_by_session_key(agent_dir, session_key, |item| {
+        let changed = item.status != status;
         item.status = status;
+        changed
     })
 }
 

@@ -1,5 +1,5 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@houston-ai/core"
-import { Check, Pencil, Play, Trash2 } from "lucide-react"
+import { Check, Pencil, RotateCw, Trash2 } from "lucide-react"
 
 /**
  * The icon-button row at the top-right of every kanban card. Pulled out
@@ -60,7 +60,11 @@ export function KanbanCardActions({
               className="p-1 rounded-md text-muted-foreground/40 hover:text-[#0066cc] hover:bg-[#0066cc]/10 transition-colors duration-200"
               aria-label={labels.resumeTooltip}
             >
-              <Play className="size-3" />
+              {/* RotateCw, not Play. `Play` reads as "start fresh", which is
+                  the opposite of what this affordance does — Resume picks up
+                  the existing provider session_id and continues the
+                  conversation in place. */}
+              <RotateCw className="size-3" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="top">{labels.resumeTooltip}</TooltipContent>

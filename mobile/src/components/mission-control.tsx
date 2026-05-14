@@ -256,6 +256,11 @@ function ConversationRow({
           <p className="truncate text-xs text-muted-foreground">
             {convo.agent_name}
             {convo.status === "interrupted" && (
+              // TODO(i18n): mobile/ doesn't yet wire react-i18next.
+              // Once it does, route this through t() — the desktop
+              // app already has translations for board:resume.* in
+              // app/src/locales/{en,es,pt}/board.json that we can
+              // reuse verbatim.
               <span className="ml-1.5 inline-flex items-center rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
                 Interrupted, tap to resume
               </span>
