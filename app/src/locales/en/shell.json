@@ -157,7 +157,8 @@
     "primaryAction": "Update and relaunch",
     "installingAction": "Installing update...",
     "relaunchAction": "Relaunch Houston",
-    "retryAction": "Try again"
+    "retryAction": "Try again",
+    "dismissAction": "Dismiss update for now"
   },
   "store": {
     "searchPlaceholder": "Search the store...",

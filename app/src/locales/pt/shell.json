@@ -157,7 +157,8 @@
     "primaryAction": "Atualizar e reiniciar",
     "installingAction": "Instalando atualização...",
     "relaunchAction": "Reiniciar Houston",
-    "retryAction": "Tentar de novo"
+    "retryAction": "Tentar de novo",
+    "dismissAction": "Dispensar atualização por enquanto"
   },
   "store": {
     "searchPlaceholder": "Buscar na loja...",

@@ -100,18 +100,35 @@ https://gethouston.ai/?utm_source=producthunt&utm_medium=referral&utm_campaign=p
 
 ## Per-event landing pages (the production-grade UX)
 
-Generic UTM URLs work but look ugly on printed materials. Better: Cloudflare Worker routes that 302-redirect short, memorable URLs to UTM-laden ones.
+Generic UTM URLs are ugly on printed materials. Use `website/src/_redirects` — Cloudflare Pages reads it on every deploy and 302-redirects short URLs to UTM-laden ones.
 
-- `gethouston.ai/yc-demo-day` → 302 → `?utm_source=qr_code&utm_medium=event&utm_campaign=yc_demo_day_2026&utm_content=qr_main`
-- `gethouston.ai/launch` → 302 → `?utm_source=direct_share&utm_medium=share&utm_campaign=launch_v0_4_13`
+Pattern (one line per campaign):
+```
+/yc-demo-day-2026   /?utm_source=qr_code&utm_medium=event&utm_campaign=yc_demo_day_2026&utm_content=qr_table_tent   302
+```
 
-Setup: see `houston-relay/` (CF Worker) — add route rules in the worker for new campaigns. ~10 LOC per campaign. The five minutes you spend per campaign compounds across all the people you send the link to.
+Add a line per IRL event / printed asset. Keep the slug short and human-printable — that's what goes on QR codes and posters. The 5 minutes of setup compound across every person you send the link to.
 
-## How this connects to the dashboards
+## How attribution flows end-to-end (the bridge)
 
-PostHog auto-captures UTMs on the `$pageview` event when the website fires it. PostHog also sets `$initial_utm_*` as **person properties** — the FIRST campaign that touched a user. This is the right default for attribution: it captures who introduced the user, even if they came back via a different channel later.
+Here's the actual machinery that connects a QR scan at an IRL event to an `install_created` event in PostHog, with the campaign attached:
 
-For Houston specifically, since the install happens in the desktop app (not the website), we use a different bridge — see `growth/attribution-architecture.md` for the cookie-based handoff from website to app's `install_created` event.
+1. **Person scans the QR** at the event → lands on `gethouston.ai/yc-demo-day-2026` (the short slug)
+2. **Cloudflare Pages reads `_redirects`** → 302 to `gethouston.ai/?utm_*` with the full UTM params
+3. **PostHog snippet on the landing page** captures the `$pageview` event with the UTMs, AND sets `$initial_utm_source/_medium/_campaign/_content` as **person properties** on the website's anonymous person profile. `person_profiles: 'always'` in `base.njk` is what makes anonymous profiles exist (otherwise they'd be deferred until identify, and the UTMs would be lost).
+4. **Person clicks Download** → the website tracks `download_clicked` with the UTMs as event props
+5. **Person installs Houston, opens it for the first time**
+6. **Houston desktop app, on first launch only** (`isNew=true` from the install_id cache in `app/src/lib/install-id.ts`): opens `https://gethouston.ai/welcome?install_id=<id>` in the user's default browser via `tauriSystem.openUrl`
+7. **The `/welcome` page** (in `website/src/welcome/index.html`) reads `?install_id=`, calls `posthog.alias(install_id)` + `posthog.identify(install_id, …)`. This MERGES the website's anonymous person — already carrying `$initial_utm_*` from step 3 — into the app's install_id.
+8. **From now on**, every event the app fires (chat_message_sent, agent_created, etc.) is associated with that install_id, which carries the original `$initial_utm_*`. Cohort filters on `$initial_utm_campaign = yc_demo_day_2026` now span both website AND app events.
+
+**Failure modes** (when attribution doesn't flow):
+- User clears cookies between the landing page visit and the install → website's anonymous person is gone before identity merge → loses UTMs
+- User has Do Not Track on → `respect_dnt: true` in `base.njk` means PostHog doesn't fire → no website-person to merge with
+- App's `openUrl` fails (no default browser configured) → `/welcome` never loads → no merge happens
+- User closes the welcome tab before PostHog's script identifies (race window ~200ms)
+
+Expected attribution coverage: ~70-85% of installs that came from a tracked campaign. Use this as a known coverage gap when computing cost-per-attributed-install.
 
 ## Adding a new vocabulary entry
 

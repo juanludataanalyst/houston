@@ -77,6 +77,17 @@ Caveats:
 - Anonymous users (never signed in) have no `email`. They are the "can't reach by email" bucket; their count on the dashboard tile vs the exportable cohort = the unreachable delta.
 - The `is_debug != true` filter applies to the dashboard tile but not to the Persons export — add it to the cohort definition manually.
 
+### Attribution bridge (website → app install)
+
+Implemented in `website/src/welcome/` + `app/src/App.tsx` first-launch path. End-to-end flow documented in `growth/utm-conventions.md`. Summary:
+
+1. Website tracks UTMs as `$initial_utm_*` person properties on the anonymous visitor (`person_profiles: 'always'` in `base.njk` makes this work for anonymous users).
+2. App on first launch (`isNew=true`) opens `https://gethouston.ai/welcome?install_id=<id>` via `tauriSystem.openUrl`.
+3. The `/welcome` page calls `posthog.identify(install_id)` which merges the anonymous website person — with its UTMs — into the install identity.
+4. All subsequent app events carry the original UTMs as person properties.
+
+Per-event short URLs (e.g. `gethouston.ai/yc-demo-day-2026`) live in `website/src/_redirects` and 302 to the UTM-laden landing page. Add one line per campaign.
+
 ### BigQuery export (optional)
 PostHog → BigQuery plugin → target GCP project (burns credits). SQL-queryable event history forever, immune to PostHog retention limits. Useful for investor-update analytics.
 

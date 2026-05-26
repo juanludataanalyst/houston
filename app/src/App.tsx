@@ -8,6 +8,7 @@ import { useHoustonInit } from "./hooks/use-houston-init";
 import { useSessionEvents } from "./hooks/use-session-events";
 import { useAgentInvalidation } from "./hooks/use-agent-invalidation";
 import { useAnalyticsSubscriber } from "./hooks/use-analytics-subscriber";
+import { useIntegrationTracker } from "./hooks/use-integration-tracker";
 import { useWorkspaceStore } from "./stores/workspaces";
 import { useAgentStore } from "./stores/agents";
 import { useUIStore } from "./stores/ui";
@@ -28,6 +29,7 @@ export default function App() {
   useSessionEvents();
   useAgentInvalidation();
   useAnalyticsSubscriber();
+  useIntegrationTracker();
   // Prefetch Composio data on launch so the integrations tab opens instantly.
   useConnections();
   useComposioApps();
@@ -35,15 +37,62 @@ export default function App() {
   // Track active installs once per day. This is the canonical DAU/WAU/MAU
   // signal; launch counts are intentionally not captured.
   useEffect(() => {
-    analytics.init().then(({ isNew }) => {
+    analytics.init().then(({ installId, isNew }) => {
       analytics.trackActive();
-      if (isNew) analytics.track("install_created");
+      if (isNew) {
+        analytics.track("install_created");
+        // Attribution bridge: open the website's /welcome page in the
+        // user's default browser. The page reads ?install_id, calls
+        // posthog.identify(install_id), which MERGES the website's
+        // anonymous person — containing $initial_utm_* from the original
+        // landing pageview — into the app's install identity. From this
+        // point on every app event carries the original attribution.
+        //
+        // Only fires once per install (isNew flips false after first
+        // launch via the install_id cache in install-id.ts). If the
+        // browser-open fails or the user closes the tab before PostHog
+        // identifies, we lose attribution for this install — that's the
+        // accepted tradeoff for not requiring clipboard/extension hacks.
+        if (installId) {
+          const url = `https://gethouston.ai/welcome?install_id=${encodeURIComponent(installId)}`;
+          tauriSystem.openUrl(url).catch(() => {
+            // openUrl failed (no default browser? dev build?) — silent;
+            // attribution falls back to app-only events with no UTMs.
+          });
+        }
+      }
       // `session_started` fires every app launch (cf. `app_active` which
       // dedupes per UTC day for DAU). Lets us measure sessions-per-day
       // intensity AND time-of-day usage patterns.
       analytics.track("session_started");
     });
     loadTheme();
+  }, []);
+
+  // Session-end signal: fired when the window goes hidden (cmd-tab away,
+  // minimize, close). Tauri's WKWebView delivers `pagehide` reliably on
+  // app close; `visibilitychange` covers the in-app cases. Used for
+  // computing session-duration distribution and pairs with `session_started`.
+  useEffect(() => {
+    let firedThisVisibility = false;
+    const onHide = () => {
+      if (firedThisVisibility) return;
+      firedThisVisibility = true;
+      analytics.track("session_ended");
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        onHide();
+      } else {
+        firedThisVisibility = false;
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onHide);
+    };
   }, []);
 
   // Supabase auth (PR 2): listen for Google OAuth deep-link callbacks.
