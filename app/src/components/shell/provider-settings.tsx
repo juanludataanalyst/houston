@@ -11,6 +11,7 @@ import { subscribeHoustonEvents } from "../../lib/events";
 import { GeminiConnectDialog } from "./gemini-connect-dialog";
 import { ProviderLoginDialog } from "./provider-login-dialog";
 import { ProviderAccountRow } from "./provider-account-row";
+import { providerAppearsConnected } from "./provider-reconnect-state";
 
 /**
  * Settings-screen variant of the AI provider UI: accounts only.
@@ -48,7 +49,15 @@ export function ProviderSettings() {
   const prevStatuses = useRef<Record<string, ProviderStatus>>({});
   const loadStatuses = useCallback(async () => {
     const results = await Promise.all(
-      PROVIDERS.map(async (p) => [p.id, await tauriProvider.checkStatus(p.id)] as const),
+      PROVIDERS.map(async (p) => {
+        const status = await tauriProvider.checkStatus(p.id);
+        // Paint each card the moment ITS probe resolves instead of blocking
+        // every card on the slowest provider — each CLI shell-out can take
+        // up to its 5s timeout, and gating the whole batch made the section
+        // feel frozen for ~6s after connect/sign-out.
+        setStatuses((prev) => ({ ...prev, [p.id]: status }));
+        return [p.id, status] as const;
+      }),
     );
     const next: Record<string, ProviderStatus> = {};
     for (const [id, status] of results) {
@@ -56,10 +65,10 @@ export function ProviderSettings() {
     }
     if (hasBaseline.current) {
       for (const prov of PROVIDERS) {
-        const wasConnected =
-          prevStatuses.current[prov.id]?.cli_installed &&
-          prevStatuses.current[prov.id]?.authenticated;
-        const isConnected = next[prov.id]?.cli_installed && next[prov.id]?.authenticated;
+        const prev = prevStatuses.current[prov.id];
+        const cur = next[prov.id];
+        const wasConnected = prev ? providerAppearsConnected(prev) : false;
+        const isConnected = cur ? providerAppearsConnected(cur) : false;
         if (!wasConnected && isConnected) {
           analytics.track("provider_configured", { provider: prov.id });
         }
@@ -67,8 +76,27 @@ export function ProviderSettings() {
     }
     prevStatuses.current = next;
     hasBaseline.current = true;
-    setStatuses(next);
     setLoading(false);
+  }, []);
+
+  // Optimistically reflect an auth outcome we already know succeeded (a
+  // completed connect or sign-out) so the card flips immediately instead of
+  // waiting on the multi-second CLI re-probe. loadStatuses still runs and
+  // reconciles against the real probe.
+  const patchAuthState = useCallback((providerId: string, authenticated: boolean) => {
+    setStatuses((prev) => {
+      const existing = prev[providerId];
+      return {
+        ...prev,
+        [providerId]: {
+          provider: existing?.provider ?? providerId,
+          cli_name: existing?.cli_name ?? "",
+          cli_installed: existing?.cli_installed ?? true,
+          auth_state: authenticated ? "authenticated" : "unauthenticated",
+          authenticated,
+        },
+      };
+    });
   }, []);
 
   useEffect(() => {
@@ -99,7 +127,7 @@ export function ProviderSettings() {
   useEffect(() => {
     if (!pendingId) return;
     const status = statuses[pendingId];
-    if (status?.cli_installed && status?.authenticated) {
+    if (status && providerAppearsConnected(status)) {
       setPendingId(null);
     }
   }, [pendingId, statuses]);
@@ -129,6 +157,8 @@ export function ProviderSettings() {
             title: t("toast.signInSucceeded", { provider: prov?.name ?? ev.data.provider }),
             variant: "success",
           });
+          // Flip the card to connected immediately; loadStatuses reconciles.
+          patchAuthState(ev.data.provider, true);
         } else if (ev.data.error) {
           addToast({
             title: t("toast.signInFailed", { provider: prov?.name ?? ev.data.provider }),
@@ -150,7 +180,7 @@ export function ProviderSettings() {
       }
     });
     return off;
-  }, [addToast, loadStatuses, t]);
+  }, [addToast, loadStatuses, patchAuthState, t]);
 
   const handleConnect = async (provider: ProviderInfo) => {
     if (provider.loginKind === "apiKey") {
@@ -197,7 +227,11 @@ export function ProviderSettings() {
     setPendingId(provider.id);
     try {
       await tauriProvider.launchLogout(provider.id);
-      await loadStatuses();
+      // Logout succeeded — flip the card to disconnected now rather than
+      // blocking the spinner on the several-second re-probe. loadStatuses
+      // reconciles in the background.
+      patchAuthState(provider.id, false);
+      void loadStatuses();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[provider-settings] launchLogout(${provider.id}) failed:`, msg);
@@ -221,7 +255,7 @@ export function ProviderSettings() {
     const disconnected: ProviderInfo[] = [];
     for (const p of PROVIDERS) {
       const s = statuses[p.id];
-      if (s?.cli_installed && s?.authenticated) connected.push(p);
+      if (s && providerAppearsConnected(s)) connected.push(p);
       else disconnected.push(p);
     }
     return [...connected, ...disconnected];
@@ -240,7 +274,7 @@ export function ProviderSettings() {
       <div className="grid grid-cols-1 gap-2">
         {orderedProviders.map((prov) => {
           const status = statuses[prov.id];
-          const connected = (status?.cli_installed && status?.authenticated) ?? false;
+          const connected = status ? providerAppearsConnected(status) : false;
           return (
             <ProviderAccountRow
               key={prov.id}
