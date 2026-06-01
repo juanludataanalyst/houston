@@ -21,6 +21,30 @@ export interface ModelOption {
    * effort row (e.g. Gemini, Haiku).
    */
   effortLevels?: readonly EffortLevel[];
+  /**
+   * Default assumed context window (tokens) — the denominator the composer's
+   * context-usage indicator STARTS with. The real window is plan/credit-gated
+   * and is NOT reported by `claude -p` (verified: the stream's `system init`
+   * event carries only `model`, no window; no flag, no env var). Specifically:
+   *   - Opus 4.x: 1M only on Max/Team/Enterprise (automatic) or with usage
+   *     credits; 200k on Pro without credits.
+   *   - Sonnet 4.6: 200k unless usage credits are enabled (on every plan).
+   *   - Codex caps gpt-5.5 at ~272k regardless of the 1M raw API offer.
+   * So this is an estimate. The indicator snaps UP to `contextWindowMax` once
+   * a session's observed usage exceeds this default, which PROVES the real
+   * window is larger (Claude Code auto-compacts before the limit, so observed
+   * usage can never exceed the true window). Omit to hide the % and show a raw
+   * token count instead.
+   */
+  contextWindow?: number;
+  /**
+   * Snap-up ceiling (tokens) for the self-correcting estimate. When a
+   * session's observed usage exceeds `contextWindow`, the indicator switches
+   * the denominator to this value. Defaults to `contextWindow` when omitted
+   * (no snapping). Set above `contextWindow` only for models whose window is
+   * gated upward at runtime — e.g. Sonnet 4.6 (200k default → 1M with credits).
+   */
+  contextWindowMax?: number;
 }
 
 /**
@@ -74,6 +98,17 @@ export const PROVIDERS: readonly ProviderInfo[] = [
         label: "GPT-5.5",
         description: "OpenAI's frontier model.",
         effortLevels: ["low", "medium", "high", "xhigh"],
+        // Codex's EFFECTIVE window = raw context_window (272k) x
+        // effective_context_window_percent (95%) = 258_400. Confirmed in
+        // Codex's own models_cache.json and the rollout's `model_context_window`
+        // — it's the number Codex `/status` shows, so it's what we divide by.
+        // The opt-in 1M gpt-5.5 variant maxes at 1_000_000 x 95% = 950_000, the
+        // snap-up ceiling reached only when observed usage exceeds 258_400
+        // (analogous to Claude's credit-gated 1M). The numerator comes from the
+        // rollout's last_token_usage (see engine `codex_rollout`), not the
+        // cumulative `turn.completed.usage`.
+        contextWindow: 258_400,
+        contextWindowMax: 950_000,
       },
     ],
     defaultModel: "gpt-5.5",
@@ -93,6 +128,12 @@ export const PROVIDERS: readonly ProviderInfo[] = [
         description: "Best balance of speed and quality.",
         // Sonnet 4.6: has `max`, no `xhigh`.
         effortLevels: ["low", "medium", "high", "max"],
+        // Sonnet 4.6 in Claude Code defaults to 200k on EVERY plan; the
+        // 1M window is opt-in via usage credits (`/extra-usage`) and is NOT
+        // part of any automatic upgrade. So start at 200k and snap to 1M only
+        // once observed usage proves the credits-enabled window is active.
+        contextWindow: 200_000,
+        contextWindowMax: 1_000_000,
       },
       {
         id: "claude-opus-4-8",
@@ -101,13 +142,19 @@ export const PROVIDERS: readonly ProviderInfo[] = [
         // Opus 4.8: full range (same as 4.7). NOTE: `ultracode` is a Claude
         // Code harness mode, NOT an effort level — never add it here.
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        // Opus 4.x auto-upgrades to 1M on Max/Team/Enterprise (the power-user
+        // default; matches what `/context` shows there). Pro WITHOUT usage
+        // credits actually runs 200k — the one case this over-estimates, and
+        // it can't self-correct downward, so the dialog flags it as estimated.
+        contextWindow: 1_000_000,
       },
       {
         id: "claude-opus-4-7",
         label: "Opus 4.7",
         description: "Previous flagship. Very capable, slower.",
-        // Opus 4.7: full range.
+        // Opus 4.7: full range. Same 1M-on-Max default as Opus 4.8 above.
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        contextWindow: 1_000_000,
       },
     ],
     defaultModel: "claude-sonnet-4-6",
@@ -127,6 +174,34 @@ export function getModel(providerId: string, modelId: string): ModelOption | und
 /** Get the default provider + model for a provider id. */
 export function getDefaultModel(providerId: string): string {
   return getProvider(providerId)?.defaultModel ?? "claude-sonnet-4-6";
+}
+
+/** Default + snap-up ceiling for a model's context window (tokens). */
+export interface ContextWindowConfig {
+  /** Starting denominator for the usage indicator (the estimate). */
+  default: number;
+  /** Snap-up ceiling once observed usage proves a larger window. */
+  max: number;
+}
+
+/**
+ * Context-window config for a provider+model, or `undefined` when the model is
+ * unknown or its window isn't catalogued (the indicator then shows a raw token
+ * count instead of a %). `max` falls back to `default` when the model has no
+ * upward gating. See `effectiveContextWindow` for how the two combine with a
+ * session's observed usage.
+ */
+export function getContextWindowConfig(
+  providerId: string | null | undefined,
+  modelId: string | null | undefined,
+): ContextWindowConfig | undefined {
+  if (!providerId || !modelId) return undefined;
+  const model = getModel(providerId, modelId);
+  if (model?.contextWindow == null) return undefined;
+  return {
+    default: model.contextWindow,
+    max: model.contextWindowMax ?? model.contextWindow,
+  };
 }
 
 /**
