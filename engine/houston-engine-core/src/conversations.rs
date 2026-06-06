@@ -39,6 +39,10 @@ struct ActivityRow {
     worktree_path: Option<String>,
     #[serde(default)]
     updated_at: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +73,10 @@ pub struct ConversationEntry {
     pub routine_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 fn read_activities(root: &Path) -> CoreResult<Vec<ActivityRow>> {
@@ -117,6 +125,8 @@ pub fn list(root: &Path) -> CoreResult<Vec<ConversationEntry>> {
             agent: row.agent,
             routine_id: row.routine_id,
             worktree_path: row.worktree_path,
+            model: row.model,
+            provider: row.provider,
         })
         .collect())
 }

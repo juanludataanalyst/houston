@@ -84,7 +84,7 @@ async fn run_provider_summary(
     let model = default_title_model(provider, model).ok_or_else(|| {
         format!("no title model wired up for provider {:?}", provider.id())
     })?;
-    provider_oneshot::run_provider_oneshot(&prompt, provider, model, SUMMARY_TIMEOUT)
+    provider_oneshot::run_provider_oneshot(&prompt, provider, Some(model), SUMMARY_TIMEOUT)
         .await
         .map_err(|e| truncate_chars(&normalize_spaces(&e), DESCRIPTION_MAX_CHARS))
 }

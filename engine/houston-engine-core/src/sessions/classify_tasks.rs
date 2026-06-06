@@ -22,39 +22,22 @@ pub async fn classify_tasks(
         return Ok(vec![]);
     }
 
-    let model = match default_model(provider, model) {
-        Some(m) => m,
-        None => {
-            tracing::warn!(
-                "classify_tasks: no model wired for provider {:?}",
-                provider.id()
-            );
-            return Ok(vec![]);
-        }
-    };
+    let effective_model = model.or_else(|| match provider.id() {
+        "anthropic" => Some("haiku"),
+        "openai" => Some("gpt-5.5-mini"),
+        "gemini" => Some("gemini-3.1-flash-lite"),
+        _ => None,
+    });
 
     let prompt = build_prompt(conversation, tasks);
 
-    let raw = match provider_oneshot::run_provider_oneshot(&prompt, provider, model, CLASSIFY_TIMEOUT).await {
-        Ok(raw) => raw,
-        Err(e) => {
-            tracing::warn!("classify_tasks: oneshot failed: {}", e);
-            return Ok(vec![]);
-        }
-    };
+    let raw = provider_oneshot::run_provider_oneshot(&prompt, provider, effective_model, CLASSIFY_TIMEOUT)
+        .await
+        .map_err(|e| crate::error::CoreError::Internal(format!("classify_tasks LLM failed: {e}")))?;
 
     Ok(parse_ids(&raw))
 }
 
-fn default_model<'a>(provider: Provider, model_override: Option<&'a str>) -> Option<&'a str> {
-    let default = match provider.id() {
-        "anthropic" => "claude-haiku-4-5",
-        "openai" => "gpt-4o-mini",
-        "gemini" => "gemini-2.0-flash-lite",
-        _ => return None,
-    };
-    Some(model_override.unwrap_or(default))
-}
 
 fn build_prompt(conversation: &str, tasks: &[TaskCandidate]) -> String {
     let task_list = tasks
@@ -64,9 +47,14 @@ fn build_prompt(conversation: &str, tasks: &[TaskCandidate]) -> String {
         .join("\n");
 
     format!(
-        "You are a task classifier. Read the conversation summary and identify which tasks from the list were completed.\n\
+        "You are a task classifier. Given a short conversation title/description, identify which tasks from the list were completed.\n\
+         The conversation may be in any language (English, Spanish, etc.) — classify by meaning, not by literal keyword match.\n\
          Return ONLY a JSON array of task IDs that were completed, or [] if none match.\n\
-         No explanation, no markdown fences, just valid JSON array of strings.\n\n\
+         No explanation, no markdown fences, just the raw JSON array.\n\
+         Examples:\n\
+           \"Hazme una lista de la barbacoa\" → [\"create_list\"]\n\
+           \"Dame ideas de regalos\" → [\"find_gift\"]\n\
+           \"Hola, ¿cómo estás?\" → []\n\n\
          Available tasks:\n{task_list}\n\n\
          Conversation:\n{conversation}"
     )

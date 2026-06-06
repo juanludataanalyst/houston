@@ -25,12 +25,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 /// Run a single prompt through the configured provider CLI and return the
-/// raw text output. `model` must be already resolved by the caller (no
-/// `Option` — pick the appropriate default before calling).
+/// raw text output. Pass `model = Some("haiku")` to force a specific model,
+/// or `None` to let the CLI use its own configured default.
 pub async fn run_provider_oneshot(
     prompt: &str,
     provider: Provider,
-    model: &str,
+    model: Option<&str>,
     time_limit: Duration,
 ) -> Result<String, String> {
     match provider.id() {
@@ -43,22 +43,27 @@ pub async fn run_provider_oneshot(
     }
 }
 
-async fn run_claude(prompt: &str, model: &str, time_limit: Duration) -> Result<String, String> {
+async fn run_claude(prompt: &str, model: Option<&str>, time_limit: Duration) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("claude");
     cmd.env("PATH", claude_path::shell_path());
     cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
     cmd.env_remove("CLAUDECODE");
-    cmd.arg("-p")
-        .arg("--model")
-        .arg(model)
-        .arg("--output-format")
+    // Run from a neutral directory so the engine's cwd CLAUDE.md (Houston
+    // source repo) is not picked up as project context — same isolation
+    // run_gemini applies for the same reason.
+    cmd.current_dir(std::env::temp_dir());
+    cmd.arg("-p");
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    cmd.arg("--output-format")
         .arg("text")
         .arg("--allowedTools")
         .arg("");
     run_command(cmd, prompt, time_limit).await
 }
 
-async fn run_codex(prompt: &str, model: &str, time_limit: Duration) -> Result<String, String> {
+async fn run_codex(prompt: &str, model: Option<&str>, time_limit: Duration) -> Result<String, String> {
     // Prefer the bundled codex (pinned in `cli-deps.json`) so one-shot
     // generation can't get sabotaged by a stale `nvm`/`brew` codex on the
     // user's PATH that doesn't recognize the model we picked.
@@ -77,13 +82,13 @@ async fn run_codex(prompt: &str, model: &str, time_limit: Duration) -> Result<St
         .arg("-c")
         .arg("model_reasoning_effort=\"low\"")
         .arg("--model")
-        .arg(model)
+        .arg(model.unwrap_or("gpt-5.5-mini"))
         .arg("-");
     let stdout = run_command(cmd, prompt, time_limit).await?;
     extract_codex_text(&stdout)
 }
 
-async fn run_gemini(prompt: &str, model: &str, time_limit: Duration) -> Result<String, String> {
+async fn run_gemini(prompt: &str, model: Option<&str>, time_limit: Duration) -> Result<String, String> {
     // Prefer the bundled gemini SEA for the same reason codex does: a
     // stale npm-global install on the user's PATH could emit a different
     // output format and break parsers. The one-shot path asks for plain
@@ -148,7 +153,7 @@ async fn run_gemini(prompt: &str, model: &str, time_limit: Duration) -> Result<S
         .arg("--yolo")
         .arg("--skip-trust")
         .arg("--model")
-        .arg(model);
+        .arg(model.unwrap_or("gemini-3.1-flash-lite"));
     run_command(cmd, prompt, time_limit).await
 }
 

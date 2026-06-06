@@ -106,7 +106,7 @@ async fn run_provider_generate(
     let model = default_gen_model(provider, model).ok_or_else(|| {
         format!("no generate model wired up for provider {:?}", provider.id())
     })?;
-    provider_oneshot::run_provider_oneshot(&prompt, provider, model, GENERATE_TIMEOUT).await
+    provider_oneshot::run_provider_oneshot(&prompt, provider, Some(model), GENERATE_TIMEOUT).await
 }
 
 fn parse_result(raw: &str) -> Result<GenerateInstructionsResult, String> {

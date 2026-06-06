@@ -80,7 +80,7 @@ pub async fn build_compaction_seed(
     let summary = provider_oneshot::run_provider_oneshot(
         &summary_request_prompt(&capped),
         provider,
-        summary_model,
+        Some(summary_model),
         SUMMARY_TIMEOUT,
     )
     .await
