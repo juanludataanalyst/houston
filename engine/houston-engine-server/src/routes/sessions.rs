@@ -23,8 +23,8 @@ use axum::{
 };
 use houston_composio::toolkit_display_name;
 use houston_engine_core::sessions::{
-    self, generate_instructions, history, resolve_agent_dir, resolve_provider, summarize,
-    SessionRuntime, StartParams,
+    self, classify_tasks, generate_instructions, history, resolve_agent_dir, resolve_provider,
+    summarize, SessionRuntime, StartParams,
 };
 use houston_engine_core::CoreError;
 use houston_terminal_manager::Provider;
@@ -50,6 +50,7 @@ pub fn router() -> Router<Arc<ServerState>> {
             get(load_history),
         )
         .route("/sessions/summarize", post(summarize_activity))
+        .route("/sessions/classify-tasks", post(classify_tasks_handler))
         .route(
             "/sessions/generate-instructions",
             post(generate_agent_instructions),
@@ -304,6 +305,53 @@ async fn cancel_session(
     )
     .await;
     Ok(Json(CancelResponse { cancelled }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClassifyTasksRequest {
+    pub conversation: String,
+    pub tasks: Vec<classify_tasks::TaskCandidate>,
+    #[serde(default)]
+    pub agent_path: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClassifyTasksResponse {
+    matched: Vec<String>,
+}
+
+async fn classify_tasks_handler(
+    State(st): State<Arc<ServerState>>,
+    Json(req): Json<ClassifyTasksRequest>,
+) -> Result<Json<ClassifyTasksResponse>, ApiError> {
+    let (provider, model) = if let Some(p_str) = req.provider.as_deref() {
+        let provider = p_str
+            .parse()
+            .map_err(|e: String| CoreError::BadRequest(e))?;
+        (provider, req.model)
+    } else if let Some(agent_path) = req.agent_path.as_deref() {
+        let agent_dir = resolve_agent_dir(&st.engine.paths, agent_path);
+        let resolved = resolve_provider(&agent_dir);
+        (resolved.provider, req.model.or(resolved.model))
+    } else {
+        (Provider::default(), req.model)
+    };
+
+    let matched = classify_tasks::classify_tasks(
+        &req.conversation,
+        &req.tasks,
+        provider,
+        model.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(ClassifyTasksResponse { matched }))
 }
 
 // ---------------------------------------------------------------------------

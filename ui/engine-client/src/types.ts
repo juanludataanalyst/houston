@@ -287,6 +287,17 @@ export interface ConversationEntry {
   agent?: string;
   routine_id?: string;
   worktree_path?: string | null;
+  model?: string;
+  provider?: string;
+}
+
+export interface TaskCandidate {
+  id: string;
+  label: string;
+}
+
+export interface ClassifyTasksResult {
+  matched: string[];
 }
 
 // ---------- Skills ----------

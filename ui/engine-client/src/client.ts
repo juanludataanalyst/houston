@@ -64,6 +64,8 @@ import type {
   GenerateInstructionsResult,
   SummarizeOptions,
   SummarizeResult,
+  TaskCandidate,
+  ClassifyTasksResult,
   TunnelStatus,
   PairingCode,
   PushRegisterRequest,
@@ -680,6 +682,18 @@ export class HoustonClient {
       provider: opts.provider,
       model: opts.model,
     });
+  }
+
+  classifyTasks(
+    conversation: string,
+    tasks: TaskCandidate[],
+    agentPath?: string,
+  ): Promise<string[]> {
+    return this.request<ClassifyTasksResult>(
+      "POST",
+      "/sessions/classify-tasks",
+      { conversation, tasks, agentPath },
+    ).then((r) => r.matched);
   }
 
   generateAgentInstructions(

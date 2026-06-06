@@ -25,6 +25,7 @@ pub mod history;
 mod provider_oneshot;
 pub mod provider;
 pub mod suggested_routine;
+pub mod classify_tasks;
 pub mod summarize;
 mod summary_text;
 mod workdir_locks;

@@ -4,6 +4,7 @@ import { BarChart2, Zap, Clock, Layers, Info, Cpu, ChevronDown, DollarSign } fro
 import { cn } from "@houston-ai/core";
 import { useCostAnalytics, aggregate, type SessionResult } from "../hooks/use-cost-analytics";
 import { LineChart } from "./usage-chart";
+import { TaskTimeline } from "./task-timeline";
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -262,7 +263,14 @@ export function UsageView() {
           </Section>
         )}
 
-{metrics.totalSessions === 0 && (
+        {(filter.kind === "agent" || (filter.kind === "all" && data.agents.length === 1)) && (
+          <Section title={t("usage.taskTimeline")}>
+            <p className="text-xs text-muted-foreground -mt-2 mb-3">{t("usage.taskTimelineSubtitle")}</p>
+            <TaskTimeline agentPath={filter.kind === "agent" ? filter.value : data.agents[0].path} />
+          </Section>
+        )}
+
+        {metrics.totalSessions === 0 && (
           <div className="text-center py-12">
             <BarChart2 className="h-10 w-10 text-muted-foreground mx-auto mb-3" />
             <p className="text-sm text-muted-foreground">{t("usage.noData")}</p>
