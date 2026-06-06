@@ -422,6 +422,9 @@
     "taskTimeline": "Linha do tempo",
     "taskTimelineSubtitle": "Tarefas concluídas por este agente e tempo estimado economizado.",
     "totalTimeSaved": "Tempo total economizado",
+    "timeSavedAcross_one": "Em {{count}} tarefa concluída",
+    "timeSavedAcross_other": "Em {{count}} tarefas concluídas",
+    "captionTimeSaved": "tempo economizado por dia",
     "noTasksFound": "Nenhuma tarefa identificada ainda. Use seu agente para ver resultados.",
     "analyzingTasks": "Analisando sessões...",
     "saved": "economizado"

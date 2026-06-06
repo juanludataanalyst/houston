@@ -152,6 +152,13 @@ export function UsageView() {
           )}
         </div>
 
+        {(filter.kind === "agent" || (filter.kind === "all" && data.agents.length === 1)) && (
+          <Section title={t("usage.taskTimeline")}>
+            <p className="text-xs text-muted-foreground -mt-2 mb-3">{t("usage.taskTimelineSubtitle")}</p>
+            <TaskTimeline agentPath={filter.kind === "agent" ? filter.value : data.agents[0].path} />
+          </Section>
+        )}
+
         {/* Close dropdown on outside click */}
         {dropdownOpen && (
           <div className="fixed inset-0 z-40" onClick={() => setDropdownOpen(false)} />
@@ -260,13 +267,6 @@ export function UsageView() {
               tooltips={recentDays.map((d) => useTokensForDay ? `${d.date.slice(5)}: ${fmtTokens(d.tokens)} tokens` : `${d.date.slice(5)}: ${fmtCost(d.cost)}`)}
               caption={useTokensForDay ? t("usage.captionByDay") : t("usage.captionByDayCost")}
             />
-          </Section>
-        )}
-
-        {(filter.kind === "agent" || (filter.kind === "all" && data.agents.length === 1)) && (
-          <Section title={t("usage.taskTimeline")}>
-            <p className="text-xs text-muted-foreground -mt-2 mb-3">{t("usage.taskTimelineSubtitle")}</p>
-            <TaskTimeline agentPath={filter.kind === "agent" ? filter.value : data.agents[0].path} />
           </Section>
         )}
 

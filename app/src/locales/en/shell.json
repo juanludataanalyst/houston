@@ -422,6 +422,9 @@
     "taskTimeline": "Task Timeline",
     "taskTimelineSubtitle": "Tasks completed by this agent, estimated time saved.",
     "totalTimeSaved": "Total time saved",
+    "timeSavedAcross_one": "Across {{count}} completed task",
+    "timeSavedAcross_other": "Across {{count}} completed tasks",
+    "captionTimeSaved": "time saved per day",
     "noTasksFound": "No tasks identified yet. Run your agent to see results.",
     "analyzingTasks": "Analyzing sessions...",
     "saved": "saved"

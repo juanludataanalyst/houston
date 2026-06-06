@@ -422,6 +422,9 @@
     "taskTimeline": "Línea de tiempo",
     "taskTimelineSubtitle": "Tareas completadas por este agente y tiempo estimado ahorrado.",
     "totalTimeSaved": "Tiempo total ahorrado",
+    "timeSavedAcross_one": "En {{count}} tarea completada",
+    "timeSavedAcross_other": "En {{count}} tareas completadas",
+    "captionTimeSaved": "tiempo ahorrado por día",
     "noTasksFound": "Aún no hay tareas identificadas. Usa tu agente para ver resultados.",
     "analyzingTasks": "Analizando sesiones...",
     "saved": "ahorrado"
